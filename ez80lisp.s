@@ -9,6 +9,9 @@
 ;
 
         .assume adl=1                   ; Use ADL mode for 24-bit addressing
+
+	INCLUDE "mos_api.inc"
+
         ORG $40000                      ; Standard Agon program start address
         JP	_start                  ; Jump over MOS header to actual code
         
@@ -46,10 +49,10 @@ MOS_PUTCHAR:    EQU $01         ; Put character to output
 MOS_EXIT:       EQU $00         ; Exit program
 
 ; MOS system variables (accessed via IX register)
-sysvar_keyascii:   EQU 05h      ; ASCII keycode
-sysvar_keymods:    EQU 06h      ; Keycode modifiers  
-sysvar_vkeycode:   EQU 0Ch      ; Virtual key code from FabGL
-sysvar_vkeydown:   EQU 0Dh      ; Key state (0=up, 1=down)
+;sysvar_keyascii:   EQU 05h      ; ASCII keycode
+;sysvar_keymods:    EQU 06h      ; Keycode modifiers  
+;sysvar_vkeycode:   EQU 0Ch      ; Virtual key code from FabGL
+;sysvar_vkeydown:   EQU 0Dh      ; Key state (0=up, 1=down)
 
 
 ;===============================================================================
@@ -286,45 +289,44 @@ print_done:
         ret
 
 getchar:        ; Get character from input, return in A
-        ; Loop until we get a valid key-down event
+        ; Use proper MOS API pattern from mos_api.inc
+        push    ix
+        push    bc
+        MOSCALL mos_sysvars             ; Get system variables pointer in IX
+        
 getchar_loop:
-        ; Get system variable base address in HL
-        rst.lil $08                     ; MOS API call
-        db      $08                     ; mos_sysvars - get system vars pointer
-        push    hl                      ; Save sysvars pointer
+        MOSCALL mos_getkey              ; Get key from keyboard
+        ld      b, a                    ; Store returned value in B
         
-        ; Now get the key
-        rst.lil $08                     ; MOS API call  
-        db      $00                     ; mos_getkey function
+        ; Check if this is a virtual key (like nano.asm does)
+        ld      a, (ix + sysvar_vkeycode) ; Check virtual key code
+        or      a                       ; Zero = normal key, non-zero = special key
+        jr      nz, getchar_loop        ; Skip special/virtual keys
         
-        ; Check if this is a key-down event (not key-up)
-        pop     hl                      ; Restore sysvars pointer
-        push    af                      ; Save the key value
-        ld      a, (hl + sysvar_vkeydown) ; Get key state
-        or      a                       ; 1 = key down, 0 = key up
-        jr      z, skip_keyup           ; Skip if key up
+        ; Get the ASCII code (like nano.asm does)
+        ld      a, (ix + sysvar_keyascii) ; Get ASCII code from system var
+        or      a                       ; Check for zero ASCII
+        jr      z, getchar_loop         ; If zero, read another key
         
-        ; This is a key-down event, get the ASCII code
-        ld      a, (hl + sysvar_keyascii) ; Get ASCII from system var
-        jr      char_ok
-
-skip_keyup:
-        pop     af                      ; Clean stack
-        jr      getchar_loop            ; Try again
-
-char_ok:
-        ; Remove old key value from stack and use ASCII value
-        pop     bc                      ; Clean stack (old key value)
-        ; Debug: show character code (comment out for release)
-        push    af
-        push    af
-        ld      hl, debug_char_msg
-        call    print_string
-        pop     af
-        call    print_hex_byte          ; Show the ASCII code
-        ld      a, ' '
-        rst.lil $10                     ; Print space
-        pop     af
+        ; Apply filtering for our LISP needs
+        cp      127                     ; Reject high ASCII
+        jr      nc, getchar_loop
+        cp      32                      ; Accept printable chars (32-126)
+        jr      nc, valid_ascii
+        ; Accept specific control chars we need
+        cp      13                      ; CR (Enter)
+        jr      z, valid_ascii
+        cp      10                      ; LF 
+        jr      z, valid_ascii
+        cp      26                      ; Ctrl-Z (exit)
+        jr      z, valid_ascii
+        cp      4                       ; Ctrl-D (EOF)
+        jr      z, valid_ascii
+        jr      getchar_loop            ; Skip other control chars
+        
+valid_ascii:
+        pop     bc
+        pop     ix
         
         ; Check for Ctrl-Z (immediate exit)
         cp      26                      ; Ctrl-Z?
