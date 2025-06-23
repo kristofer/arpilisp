@@ -45,6 +45,12 @@ MOS_GETCHAR:    EQU $00         ; Get character from input
 MOS_PUTCHAR:    EQU $01         ; Put character to output
 MOS_EXIT:       EQU $00         ; Exit program
 
+; MOS system variables (accessed via IX register)
+sysvar_keyascii:   EQU 05h      ; ASCII keycode
+sysvar_keymods:    EQU 06h      ; Keycode modifiers  
+sysvar_vkeycode:   EQU 0Ch      ; Virtual key code from FabGL
+sysvar_vkeydown:   EQU 0Dh      ; Key state (0=up, 1=down)
+
 
 ;===============================================================================
 ; Data Section
@@ -59,64 +65,107 @@ lispsp:         DS 3                    ; Lisp stack pointer
 cellcount:      DS 3                    ; Number of allocated cells
 
 ; String constants
+foo:            DB "foo", $0D, $0A, 0
 greeting:       DB "Agon eZ80 Lisp", $0D, $0A, 0
 prompt:         DB "> ", 0
 error_msg:      DB "Error: ", 0
 goodbye_msg:    DB "Goodbye!", $0D, $0A, 0
+immediate_exit_msg: DB $0D, $0A, "Exiting to MOS...", $0D, $0A, 0
+debug_char_msg: DB "[", 0
 
 ;===============================================================================
 ; Program Entry Point
 ;===============================================================================
 
 _start:
-        ; Initialize eZ80 ADL mode
-        ld      hl, 0                   ; Clear registers
+        ; Preserve MOS state and initialize stack for ADL mode
+        ; Don't clear IX/IY as they may contain MOS values
+        
+        ; Initialize basic registers only
+        ld      hl, 0
         ld      bc, 0
         ld      de, 0
-        ld      ix, 0
-        ld      iy, 0
- 
-        ; Initialize data structures
+        
+        ; Test basic output first
+        ld      hl, foo
+        call    print_string
+        
+        ; Initialize memory system carefully
         call    init_memory
+        
+        ; Test after memory init
+        ld      hl, foo  
+        call    print_string
+        
+        ; Initialize symbol table
         call    init_symbols
+        
+        ; Test after symbols init
+        ld      hl, foo
+        call    print_string
         
         ; Display greeting
         ld      hl, greeting
         call    print_string
-               
-        ; Start REPL
+        
+        ; Start REPL (Read-Eval-Print Loop)
         call    repl
         
-        ; Exit program
-        jp      finish
+        ; Exit cleanly
+        ret                             ; Return to MOS instead of custom exit
 
 ;===============================================================================
 ; Memory Management
 ;===============================================================================
 
 init_memory:
-        ; Initialize free list of cons cells
+        ; Initialize free list of cons cells with simple linking
         ld      hl, cells               ; Start of cell pool
         ld      (freelist), hl          ; First free cell
-        ld      bc, CELLMAX - 1         ; Number of cells to link
-        ld      de, 6                   ; Size of each cell (car + cdr)
+        ld      bc, CELLMAX - 1         ; Use BC as counter
         
-init_loop:
-        push    hl                      ; Current cell
-        pop     ix
-        add     hl, de                  ; Next cell address
-        ld      (ix + 3), hl            ; Link to next cell (cdr)
+init_cell_loop:
+        ; Current cell at HL, calculate next cell address
+        push    bc                      ; Save counter
+        push    hl                      ; Save current cell
+        ld      de, 6                   ; Cell size
+        add     hl, de                  ; HL = next cell address
+        push    hl
+        pop     de                      ; DE = next cell address
+        pop     hl                      ; Restore current cell
+        
+        ; Store next cell address in current cell's cdr field (offset +3)  
+        push    hl
+        push    de
+        ld      de, 3
+        add     hl, de
+        pop     de
+        ld      (hl), de                ; Store next cell pointer
+        pop     hl
+        
+        ; Move to next cell
+        push    de
+        pop     hl
+        pop     bc                      ; Restore counter
         dec     bc
-        jr      nz, init_loop
         
-        ; Last cell points to NIL
-        ld      (ix + 3), NIL
+        ; Check if more cells to process
+        ld      a, c
+        or      b
+        jr      nz, init_cell_loop
         
-        ; Initialize Lisp stack
+        ; Last cell cdr points to NIL
+        push    hl
+        ld      de, 3
+        add     hl, de
+        ld      (hl), NIL
+        pop     hl
+        
+        ; Initialize Lisp stack pointer  
         ld      hl, lispstack
         ld      (lispsp), hl
         
-        ; Initialize cell counter
+        ; Initialize cell counter to zero
         ld      hl, 0
         ld      (cellcount), hl
         
@@ -237,8 +286,102 @@ print_done:
         ret
 
 getchar:        ; Get character from input, return in A
-        rst.lil $18                     ; MOS API call
-        db      $00                     ; mos_getkey
+        ; Loop until we get a valid key-down event
+getchar_loop:
+        ; Get system variable base address in HL
+        rst.lil $08                     ; MOS API call
+        db      $08                     ; mos_sysvars - get system vars pointer
+        push    hl                      ; Save sysvars pointer
+        
+        ; Now get the key
+        rst.lil $08                     ; MOS API call  
+        db      $00                     ; mos_getkey function
+        
+        ; Check if this is a key-down event (not key-up)
+        pop     hl                      ; Restore sysvars pointer
+        push    af                      ; Save the key value
+        ld      a, (hl + sysvar_vkeydown) ; Get key state
+        or      a                       ; 1 = key down, 0 = key up
+        jr      z, skip_keyup           ; Skip if key up
+        
+        ; This is a key-down event, get the ASCII code
+        ld      a, (hl + sysvar_keyascii) ; Get ASCII from system var
+        jr      char_ok
+
+skip_keyup:
+        pop     af                      ; Clean stack
+        jr      getchar_loop            ; Try again
+
+char_ok:
+        ; Remove old key value from stack and use ASCII value
+        pop     bc                      ; Clean stack (old key value)
+        ; Debug: show character code (comment out for release)
+        push    af
+        push    af
+        ld      hl, debug_char_msg
+        call    print_string
+        pop     af
+        call    print_hex_byte          ; Show the ASCII code
+        ld      a, ' '
+        rst.lil $10                     ; Print space
+        pop     af
+        
+        ; Check for Ctrl-Z (immediate exit)
+        cp      26                      ; Ctrl-Z?
+        jr      z, immediate_exit
+        
+        ; Echo the character back to screen (unless it's special)
+        cp      13                      ; Carriage return?
+        jr      z, getchar_echo
+        cp      10                      ; Line feed?
+        jr      z, getchar_echo
+        cp      4                       ; Ctrl-D (EOF)?
+        jr      z, getchar_no_echo
+        cp      32                      ; Printable characters (>= space)
+        jr      c, getchar_no_echo
+        
+getchar_echo:
+        push    af                      ; Save character
+        rst.lil $10                     ; Echo to screen
+        pop     af                      ; Restore character
+        
+getchar_no_echo:
+        ; Store character in lookbuffer
+        ld      (lookbuffer), a
+        ret
+
+immediate_exit:
+        ; Print exit message and return to MOS immediately
+        ld      hl, immediate_exit_msg
+        call    print_string
+        ret                             ; Return to MOS
+
+print_hex_byte:
+        ; Print byte in A as two hex digits
+        push    af
+        rrca
+        rrca
+        rrca
+        rrca
+        and     $0F
+        call    print_hex_digit
+        pop     af
+        and     $0F
+        call    print_hex_digit
+        ld      a, ']'
+        rst.lil $10
+        ret
+
+print_hex_digit:
+        ; Print hex digit in A (0-15)
+        cp      10
+        jr      c, print_digit
+        add     a, 'A' - 10
+        rst.lil $10
+        ret
+print_digit:
+        add     a, '0'
+        rst.lil $10
         ret
 
 ;===============================================================================
@@ -252,21 +395,10 @@ internbuffer:   DS INTERNMAX
 
 ; Pre-defined symbols in obarray
 init_symbols:
-        ; Initialize symbol table  
-        ld      hl, obarray
-        ld      bc, OBARRAYMAX
-        ld      de, 0
-        
-clear_obarray:
-        ld      (hl), de                ; Set to NIL
-        inc     hl
-        inc     hl  
-        inc     hl                      ; 24-bit pointers
-        dec     bc
-        jr      nz, clear_obarray
-        
-        ; Add built-in symbols
-        call    init_builtin_symbols
+        ; Simple initialization for testing
+        ; Just clear the intern buffer length
+        ld      hl, 0
+        ld      (internbufferlen), hl
         ret
 
 init_builtin_symbols:
@@ -1363,12 +1495,15 @@ sweep_done:
 ; Character classification
 iswhite:        ; Check if character in A is whitespace
         cp      ' '
-        ret     z
+        ret     z                       ; Return Z set if space
         cp      9                       ; Tab
-        ret     z
+        ret     z                       ; Return Z set if tab
         cp      10                      ; Newline
-        ret     z
+        ret     z                       ; Return Z set if newline
         cp      13                      ; Carriage return
+        ret     z                       ; Return Z set if carriage return
+        ; Not whitespace - clear Z flag and return
+        or      a                       ; Clear Z flag (NZ condition)
         ret
 
 issym:          ; Check if character in A is valid for symbol
@@ -1388,22 +1523,22 @@ issym:          ; Check if character in A is valid for symbol
 
 ; Skip whitespace
 skipwhite:
-        push    af
+        ; Skip whitespace characters, leaving first non-white in lookbuffer
 skip_loop:
-        call    getchar
-        call    iswhite
-        jr      z, skip_loop
-        pop     af
-        ret
+        call    getchar                 ; Read character and echo it
+        ld      a, (lookbuffer)         ; Get the character
+        call    iswhite                 ; Check if it's whitespace
+        jr      z, skip_loop            ; If whitespace, read another
+        ret                             ; Non-whitespace found, return
 
-; Current input character
-lookbuffer:     db      10              ; Start with newline
+; Current input character  
+lookbuffer:     db      0               ; Start with null character
 
 ; Read S-expression from input
 ; Output: HL = parsed expression
 read_expr:
-        call    skipwhite
-        ld      a, (lookbuffer)
+        call    skipwhite               ; This will call getchar and update lookbuffer
+        ld      a, (lookbuffer)         ; Get the character that was read
         
         ; Check for EOF (Ctrl+D = 4)
         cp      4
