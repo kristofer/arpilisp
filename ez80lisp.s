@@ -10,6 +10,13 @@
 
         .assume adl=1                   ; Use ADL mode for 24-bit addressing
         ORG $40000                      ; Standard Agon program start address
+        JP	_start                  ; Jump over MOS header to actual code
+        
+        ; Pad to ensure MOS header is at exactly offset $40
+        ORG $40000 + $40
+        DB	"MOS"           ; Flag for MOS - to confirm this is a valid MOS command
+	DB	0               ; MOS header version 0
+	DB	1               ; Flag for run mode (0: Z80, 1: ADL)
 
 ; eZ80 Register Mapping from ARM:
 ; ARM r0-r3  -> eZ80 A, BC, DE, HL (function args/return values)  
@@ -68,7 +75,7 @@ _start:
         ld      de, 0
         ld      ix, 0
         ld      iy, 0
-        
+ 
         ; Initialize data structures
         call    init_memory
         call    init_symbols
@@ -76,7 +83,7 @@ _start:
         ; Display greeting
         ld      hl, greeting
         call    print_string
-        
+               
         ; Start REPL
         call    repl
         
@@ -220,8 +227,7 @@ print_loop:
         jr      z, print_done
         
         ; Output character via MOS
-        rst.lil $18                     ; MOS API call
-        db      MOS_PUTCHAR
+        rst.lil $10                     ; MOS character output
         
         inc     bc
         jr      print_loop
@@ -232,7 +238,7 @@ print_done:
 
 getchar:        ; Get character from input, return in A
         rst.lil $18                     ; MOS API call
-        db      MOS_GETCHAR
+        db      $00                     ; mos_getkey
         ret
 
 ;===============================================================================
@@ -457,11 +463,9 @@ repl_loop:
         
         ; Print newline
         ld      a, $0D
-        rst.lil $18
-        db      MOS_PUTCHAR
+        rst.lil $10
         ld      a, $0A
-        rst.lil $18
-        db      MOS_PUTCHAR
+        rst.lil $10
         
         ; Clean up stack
         pop     hl
@@ -1543,14 +1547,12 @@ print_expr:
         
         ; It's a cons cell - print as list
         ld      a, '('
-        rst.lil $18
-        db      MOS_PUTCHAR
+        rst.lil $10
         
         call    print_list_contents
         
         ld      a, ')'
-        rst.lil $18
-        db      MOS_PUTCHAR
+        rst.lil $10
         
         jr      print_expr_done
 
@@ -1604,8 +1606,7 @@ panic:  ; Print error message and exit
         ; Fall through to finish
 
 finish: ; Exit program
-        rst.lil $18                     ; MOS API call
-        db      MOS_EXIT
+        ret                             ; Return to MOS
         
         ; Should not reach here
         halt
