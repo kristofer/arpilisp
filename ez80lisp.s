@@ -49,11 +49,17 @@ MOS_GETCHAR:    EQU $00         ; Get character from input
 MOS_PUTCHAR:    EQU $01         ; Put character to output
 MOS_EXIT:       EQU $00         ; Exit program
 
-; MOS system variables (accessed via IX register)
-;sysvar_keyascii:   EQU 05h      ; ASCII keycode
-;sysvar_keymods:    EQU 06h      ; Keycode modifiers  
-;sysvar_vkeycode:   EQU 0Ch      ; Virtual key code from FabGL
-;sysvar_vkeydown:   EQU 0Dh      ; Key state (0=up, 1=down)
+; Token types for tokenizer
+TOKEN_EOF:      EQU 0           ; End of input
+TOKEN_LPAREN:   EQU 1           ; (
+TOKEN_RPAREN:   EQU 2           ; )
+TOKEN_SYMBOL:   EQU 3           ; Symbol/identifier
+TOKEN_NUMBER:   EQU 4           ; Number (future use)
+TOKEN_DOT:      EQU 5           ; . (future use)
+
+; Token buffer constants
+TOKENBUFMAX:    EQU 100         ; Maximum tokens in buffer
+TOKENMAX:       EQU 50          ; Maximum token data length
 
 
 ;===============================================================================
@@ -76,6 +82,14 @@ error_msg:      DB "Error: ", 0
 goodbye_msg:    DB "Goodbye!", $0D, $0A, 0
 immediate_exit_msg: DB $0D, $0A, "Exiting to MOS...", $0D, $0A, 0
 debug_char_msg: DB "[", 0
+
+; Tokenizer data structures
+token_buffer:   DS TOKENBUFMAX * 4      ; Token buffer: type(1) + length(1) + data_ptr(2)
+token_data:     DS TOKENBUFMAX * TOKENMAX ; Storage for token data
+token_count:    DS 1                    ; Number of tokens in buffer
+token_index:    DS 1                    ; Current token being parsed
+current_line:   DS TOKENMAX             ; Current input line buffer
+line_pos:       DS 1                    ; Position in current line
 
 ;===============================================================================
 ; Program Entry Point
@@ -179,14 +193,30 @@ cons:   ; HL = car, DE = cdr, returns new cell in HL
         push    bc
         push    ix
         
+        ; Save car and cdr values
+        push    hl                      ; Save car
+        push    de                      ; Save cdr
+        
         ; Get free cell
-        ld      ix, (freelist)
-        ld      bc, (ix + 3)            ; Next free cell
-        ld      (freelist), bc          ; Update free list
+        ld      hl, freelist
+        ld      ix, (hl)
+        push    ix
+        pop     hl
+        ld      bc, 3
+        add     hl, bc
+        ld      bc, (hl)                ; Next free cell
+        ld      hl, freelist
+        ld      (hl), bc                ; Update free list
         
         ; Initialize cell
+        pop     de                      ; Restore cdr
+        pop     hl                      ; Restore car
         ld      (ix), hl                ; Set car
-        ld      (ix + 3), de            ; Set cdr
+        push    ix
+        pop     hl
+        ld      bc, 3
+        add     hl, bc
+        ld      (hl), de                ; Set cdr
         
         ; Return cell address
         push    ix
@@ -351,6 +381,448 @@ immediate_exit:
         call    print_string
         ; Jump directly to the end of the program instead of returning
         jp      finish
+
+;===============================================================================
+; Tokenizer Functions
+;===============================================================================
+
+; Read a complete line of input into current_line buffer
+read_line:
+        ld      hl, current_line
+        ld      b, 0                    ; Character count
+        
+read_line_loop:
+        call    getchar
+        cp      13                      ; Carriage return?
+        jr      z, read_line_done
+        cp      4                       ; Ctrl-D (EOF)?
+        jr      z, read_line_eof
+        cp      26                      ; Ctrl-Z (immediate exit)?
+        jr      z, immediate_exit
+        
+        ; Store character in line buffer
+        ld      (hl), a
+        inc     hl
+        inc     b
+        
+        ; Check buffer overflow
+        ld      a, b
+        cp      TOKENMAX - 1
+        jr      c, read_line_loop
+        
+read_line_done:
+        ; Null terminate the line
+        ld      (hl), 0
+        ld      a, b
+        ld      (line_pos), a           ; Store line length
+        xor     a                       ; Return success
+        ret
+        
+read_line_eof:
+        ; EOF encountered
+        ld      (hl), 0
+        ld      a, 1                    ; Return EOF flag
+        ret
+
+; Tokenize the current line into token_buffer
+tokenize_line:
+        ld      hl, current_line
+        ld      bc, 0                   ; BC = position in line
+        ld      de, 0                   ; DE = token count
+        
+tokenize_loop:
+        ; Skip whitespace
+        call    skip_whitespace_in_line
+        
+        ; Check for end of line
+        ld      a, (hl)
+        or      a
+        jr      z, tokenize_done
+        
+        ; Check for special characters
+        cp      '('
+        jr      z, tokenize_lparen
+        cp      ')'
+        jr      z, tokenize_rparen
+        cp      '.'
+        jr      z, tokenize_dot
+        
+        ; Must be a symbol
+        call    tokenize_symbol
+        jr      tokenize_loop
+        
+tokenize_lparen:
+        ld      a, TOKEN_LPAREN
+        call    add_simple_token
+        inc     hl
+        jr      tokenize_loop
+        
+tokenize_rparen:
+        ld      a, TOKEN_RPAREN
+        call    add_simple_token
+        inc     hl
+        jr      tokenize_loop
+        
+tokenize_dot:
+        ld      a, TOKEN_DOT
+        call    add_simple_token
+        inc     hl
+        jr      tokenize_loop
+        
+tokenize_done:
+        ; Add EOF token
+        ld      a, TOKEN_EOF
+        call    add_simple_token
+        ld      a, e
+        ld      (token_count), a
+        ret
+
+; Skip whitespace in line, HL points to current position
+skip_whitespace_in_line:
+skip_ws_loop:
+        ld      a, (hl)
+        cp      ' '
+        jr      z, skip_ws_next
+        cp      9                       ; Tab
+        jr      z, skip_ws_next
+        ret                             ; Non-whitespace found
+        
+skip_ws_next:
+        inc     hl
+        jr      skip_ws_loop
+
+; Add a simple token (no data) - token type in A
+add_simple_token:
+        push    hl
+        push    de
+        
+        ; Calculate token buffer position
+        ld      h, 0
+        ld      l, e                    ; E contains token count
+        add     hl, hl
+        add     hl, hl                  ; HL = token_count * 4
+        ld      bc, token_buffer
+        add     hl, bc                  ; HL points to token slot
+        
+        ; Store token: type, length=0, data_ptr=0
+        ld      (hl), a                 ; Token type
+        inc     hl
+        ld      (hl), 0                 ; Length = 0
+        inc     hl
+        ld      (hl), 0                 ; Data ptr low = 0
+        inc     hl
+        ld      (hl), 0                 ; Data ptr high = 0
+        
+        inc     e                       ; Increment token count
+        pop     de
+        pop     hl
+        ret
+
+; Tokenize a symbol starting at HL
+tokenize_symbol:
+        push    hl                      ; Save start position
+        ld      c, 0                    ; Symbol length counter
+        push    hl                      ; Save start for later
+        
+symbol_length_loop:
+        ld      a, (hl)
+        ; Debug: print the character being checked
+        push    af
+        rst.lil $10
+        pop     af
+        
+        call    is_symbol_char
+        jr      z, symbol_length_done   ; Z flag set = not valid char
+        inc     hl
+        inc     c
+        jr      symbol_length_loop
+        
+symbol_length_done:
+        ; C contains symbol length, HL points after symbol
+        push    hl                      ; Save end position
+        
+        ; Calculate destination in token_data
+        ld      a, e                    ; Token count
+        ld      h, 0
+        ld      l, a
+        push    de                      ; Save DE (token count in E)
+        ld      de, TOKENMAX
+        call    multiply_hl_de          ; HL = token_count * TOKENMAX
+        ld      de, token_data
+        add     hl, de                  ; HL points to token data space
+        
+        ; Set up for copy: HL=dest, BC=length, source on stack
+        ld      d, h
+        ld      e, l                    ; DE = destination
+        ld      b, 0                    ; BC = symbol length
+        pop     hl                      ; HL = end position (discard)
+        pop     hl                      ; HL = start position
+        
+        ; Copy the symbol data
+        ld      a, c
+        or      a
+        jr      z, symbol_copy_done     ; Skip if zero length
+        ldir                            ; Copy BC bytes from HL to DE
+        
+symbol_copy_done:
+        ; Null terminate the symbol
+        ld      a, 0
+        ld      (de), a
+        
+        ; Create token entry
+        pop     de                      ; Restore DE (token count in E)
+        pop     hl                      ; HL = end position after symbol
+        ld      a, TOKEN_SYMBOL
+        ld      b, c                    ; B = symbol length
+        call    add_symbol_token
+        ret
+
+; Add symbol token - type in A, length in B, data ptr calculated
+add_symbol_token:
+        push    hl
+        push    de
+        
+        ; Calculate token buffer position
+        ld      h, 0
+        ld      l, e                    ; E contains token count
+        add     hl, hl
+        add     hl, hl                  ; HL = token_count * 4
+        ld      de, token_buffer
+        add     hl, de                  ; HL points to token slot
+        
+        ; Store token type
+        ld      (hl), a
+        inc     hl
+        
+        ; Store length
+        ld      (hl), b
+        inc     hl
+        
+        ; Calculate and store data pointer
+        ld      a, e                    ; Token count
+        push    hl
+        ld      h, 0
+        ld      l, a
+        ld      de, TOKENMAX
+        call    multiply_hl_de          ; HL = token_count * TOKENMAX
+        ld      de, token_data
+        add     hl, de                  ; HL = data pointer
+        pop     de                      ; DE = token slot position
+        push    hl                      ; Save data pointer
+        push    de
+        pop     ix                      ; IX = token slot position
+        pop     hl                      ; HL = data pointer
+        ld      (ix), l                 ; Store data ptr low
+        ld      (ix + 1), h             ; Store data ptr high
+        
+        inc     e                       ; Increment token count
+        pop     de
+        pop     hl
+        ret
+
+; Check if character in A is valid for symbols
+; Return: Z flag set if NOT valid, Z flag clear if valid
+is_symbol_char:
+        cp      '('
+        ret     z                       ; Not valid (Z set)
+        cp      ')'
+        ret     z                       ; Not valid (Z set)
+        cp      '.'
+        ret     z                       ; Not valid (Z set)
+        cp      ' '
+        ret     c                       ; Control chars not valid (C set, Z varies)
+        cp      127
+        ret     nc                      ; DEL and above not valid (C clear, Z varies)
+        ; Valid symbol character - clear Z flag
+        cp      a                       ; Always clears Z flag (makes it NZ)
+        ret
+
+; Multiply HL by DE, result in HL (simple version)
+multiply_hl_de:
+        ld      c, l
+        ld      b, h                    ; BC = HL
+        ld      hl, 0
+mult_loop:
+        ld      a, c
+        or      b
+        ret     z
+        add     hl, de
+        dec     bc
+        jr      mult_loop
+
+;===============================================================================
+; Token-based Parser Functions
+;===============================================================================
+
+; Get current token info
+; Output: A = token type, B = token length, HL = data pointer
+get_current_token:
+        ld      a, (token_index)
+        ld      h, 0
+        ld      l, a
+        add     hl, hl
+        add     hl, hl                  ; HL = token_index * 4
+        ld      de, token_buffer
+        add     hl, de                  ; HL points to token
+        
+        ld      a, (hl)                 ; A = token type
+        inc     hl
+        ld      b, (hl)                 ; B = token length
+        inc     hl
+        ld      e, (hl)                 ; E = data ptr low
+        inc     hl
+        ld      d, (hl)                 ; D = data ptr high
+        ld      h, d
+        ld      l, e                    ; HL = data pointer
+        ret
+
+; Advance to next token
+next_token:
+        ld      a, (token_index)
+        inc     a
+        ld      (token_index), a
+        ret
+
+; New read_expr using tokenizer
+; Output: HL = parsed expression
+read_expr_new:
+        call    get_current_token
+        
+        ; Check token type
+        cp      TOKEN_EOF
+        jr      z, read_eof_new
+        cp      TOKEN_LPAREN
+        jr      z, read_list_new
+        cp      TOKEN_RPAREN
+        jr      z, read_error_new
+        cp      TOKEN_SYMBOL
+        jr      z, read_symbol_new
+        
+        ; Unknown token
+        jr      read_error_new
+        
+read_eof_new:
+        ld      hl, EOF_MARKER
+        ret
+        
+read_error_new:
+        ld      hl, NIL
+        ret
+        
+read_symbol_new:
+        ; B = length, HL = data pointer
+        ; Copy symbol data to internbuffer
+        ld      c, b                    ; C = length
+        ld      de, internbuffer
+        ld      b, 0                    ; BC = length (zero high byte)
+        ld      (internbufferlen), bc
+        
+        ; Copy the symbol data
+        ld      a, c
+        or      a
+        jr      z, symbol_copied        ; Skip if zero length
+        ldir                            ; Copy BC bytes from HL to DE
+        
+symbol_copied:
+        ; Null terminate
+        ld      a, 0
+        ld      (de), a
+        
+        call    next_token
+        call    intern
+        ret
+        
+read_list_new:
+        call    next_token              ; Skip opening (
+        
+        ; Check for empty list
+        call    get_current_token
+        cp      TOKEN_RPAREN
+        jr      z, read_empty_list_new
+        
+        ; Read first element
+        call    read_expr_new
+        push    hl                      ; Save first element
+        
+        ; Create list starting with first element
+        push    hl
+        pop     bc                      ; BC = first element
+        ld      de, NIL
+        call    lisp_cons
+        push    hl
+        pop     ix                      ; IX = list start
+        push    hl
+        pop     iy                      ; IY = list end
+        
+read_list_loop_new:
+        call    get_current_token
+        
+        ; Check for end of list
+        cp      TOKEN_RPAREN
+        jr      z, read_list_done_new
+        cp      TOKEN_EOF
+        jr      z, read_error_new       ; Unexpected EOF
+        
+        ; Read next element
+        call    read_expr_new
+        
+        ; Append to list
+        push    hl
+        pop     bc                      ; BC = new element
+        ld      de, NIL
+        call    lisp_cons               ; Create new cons cell
+        
+        ; Link to end of list (need to handle 24-bit addressing)
+        push    ix                      ; Save list start
+        push    iy
+        pop     hl                      ; HL = current list end
+        ld      bc, 3
+        add     hl, bc                  ; HL points to CDR of last cell
+        push    hl
+        pop     ix                      ; IX = CDR location
+        ld      (ix), l                 ; Store new cell pointer low
+        ld      (ix + 1), h             ; Store new cell pointer high
+        ld      (ix + 2), 0             ; Clear high byte for 24-bit
+        
+        push    hl
+        pop     iy                      ; Update list end
+        pop     ix                      ; Restore list start
+        
+        jr      read_list_loop_new
+        
+read_list_done_new:
+        call    next_token              ; Skip closing )
+        push    ix
+        pop     hl                      ; Return list start
+        ret
+        
+read_empty_list_new:
+        call    next_token              ; Skip closing )
+        ld      hl, NIL
+        ret
+
+; New main read function
+; Output: HL = parsed expression or EOF_MARKER
+read_expression:
+        ; Read a line of input
+        call    read_line
+        or      a
+        jr      nz, read_expr_eof       ; EOF
+        
+        ; Tokenize the line
+        call    tokenize_line
+        
+        ; Reset token index
+        xor     a
+        ld      (token_index), a
+        
+        ; Parse expression from tokens
+        call    read_expr_new
+        ret
+        
+read_expr_eof:
+        ld      hl, EOF_MARKER
+        ret
 
 print_hex_byte:
         ; Print byte in A as two hex digits
@@ -617,13 +1089,15 @@ repl_loop:
         ld      hl, prompt
         call    print_string
         
-        ; Read expression
-        call    read_expr
+        ; Read expression using new tokenizer
+        call    read_expression
         
         ; Check for EOF marker
-        ld      a, h
-        or      l
-        jr      z, repl_exit            ; Simple check: if HL is 0, treat as EOF
+        ld      bc, EOF_MARKER
+        and     a
+        sbc     hl, bc
+        jr      z, repl_exit
+        add     hl, bc                  ; Restore HL
         
         ; Save expression for evaluation
         push    hl
