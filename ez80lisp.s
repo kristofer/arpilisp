@@ -426,11 +426,19 @@ read_line_eof:
 
 ; Tokenize the current line into token_buffer
 tokenize_line:
+        ; Debug: print M at start of tokenize
+        ld      a, 'M'
+        rst.lil $10
+        
         ld      hl, current_line
         ld      bc, 0                   ; BC = position in line
         ld      de, 0                   ; DE = token count
         
 tokenize_loop:
+        ; Debug: print N in tokenize loop
+        ld      a, 'N'
+        rst.lil $10
+        
         ; Skip whitespace
         call    skip_whitespace_in_line
         
@@ -526,11 +534,6 @@ tokenize_symbol:
         
 symbol_length_loop:
         ld      a, (hl)
-        ; Debug: print the character being checked
-        push    af
-        rst.lil $10
-        pop     af
-        
         call    is_symbol_char
         jr      z, symbol_length_done   ; Z flag set = not valid char
         inc     hl
@@ -634,7 +637,7 @@ is_symbol_char:
         cp      127
         ret     nc                      ; DEL and above not valid (C clear, Z varies)
         ; Valid symbol character - clear Z flag
-        cp      a                       ; Always clears Z flag (makes it NZ)
+        or      1                       ; Clear Z flag (set NZ - valid character)
         ret
 
 ; Multiply HL by DE, result in HL (simple version)
@@ -804,13 +807,25 @@ read_empty_list_new:
 ; New main read function
 ; Output: HL = parsed expression or EOF_MARKER
 read_expression:
+        ; Debug: print L before read_line
+        ld      a, 'L'
+        rst.lil $10
+        
         ; Read a line of input
         call    read_line
         or      a
         jr      nz, read_expr_eof       ; EOF
         
+        ; Debug: print K after read_line
+        ld      a, 'K'
+        rst.lil $10
+        
         ; Tokenize the line
         call    tokenize_line
+        
+        ; Debug: print Z after tokenize
+        ld      a, 'Z'
+        rst.lil $10
         
         ; Reset token index
         xor     a
@@ -1092,12 +1107,20 @@ repl_loop:
         ; Read expression using new tokenizer
         call    read_expression
         
+        ; Debug: print T after tokenizer
+        ld      a, 'T'
+        rst.lil $10
+        
         ; Check for EOF marker
         ld      bc, EOF_MARKER
         and     a
         sbc     hl, bc
         jr      z, repl_exit
         add     hl, bc                  ; Restore HL
+        
+        ; Debug: print P after EOF check
+        ld      a, 'P'
+        rst.lil $10
         
         ; Save expression for evaluation
         push    hl
