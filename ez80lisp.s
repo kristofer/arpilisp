@@ -42,6 +42,7 @@ LISPSTACKMAX:   EQU 1000        ; Lisp stack size
 NIL:            EQU 0           ; Null pointer
 SYMMASK:        EQU 1           ; Symbol identifier bit
 MARKMASK:       EQU 2           ; GC mark bit
+EOF_MARKER:     EQU $FFFF       ; Special marker for EOF (not a valid pointer)
 
 ; Agon system call numbers (MOS API)
 MOS_GETCHAR:    EQU $00         ; Get character from input
@@ -80,9 +81,13 @@ debug_char_msg: DB "[", 0
 ; Program Entry Point
 ;===============================================================================
 
+; Save original stack pointer for clean exit
+original_sp:    DS 3
+
 _start:
         ; Preserve MOS state and initialize stack for ADL mode
-        ; Don't clear IX/IY as they may contain MOS values
+        ; Save original stack pointer for clean exit
+        ld      (original_sp), sp
         
         ; Initialize basic registers only
         ld      hl, 0
@@ -95,18 +100,13 @@ _start:
         
         ; Initialize memory system carefully
         call    init_memory
-        
-        ; Test after memory init
-        ld      hl, foo  
-        call    print_string
-        
+                
         ; Initialize symbol table
         call    init_symbols
         
-        ; Test after symbols init
-        ld      hl, foo
-        call    print_string
-        
+        ; Initialize built-in symbols (quote, atom, car, cdr, etc.)
+        call    init_builtin_symbols
+               
         ; Display greeting
         ld      hl, greeting
         call    print_string
@@ -267,85 +267,78 @@ poplisp:        ; Pop from Lisp stack into HL
 ;===============================================================================
 
 print_string:   ; Print null-terminated string at HL
-        push    bc
         push    hl
-        pop     bc
         
 print_loop:
-        push    bc
-        pop     hl
-        ld      a, (hl)
-        or      a
+        ld      a, (hl)                 ; Load character
+        or      a                       ; Check for null terminator
         jr      z, print_done
         
-        ; Output character via MOS
+        ; Output character via MOS (character already in A)
         rst.lil $10                     ; MOS character output
         
-        inc     bc
+        inc     hl                      ; Next character
         jr      print_loop
         
 print_done:
-        pop     bc
+        pop     hl
         ret
 
 getchar:        ; Get character from input, return in A
-        ; Use proper MOS API pattern from mos_api.inc
-        push    ix
-        push    bc
-        MOSCALL mos_sysvars             ; Get system variables pointer in IX
+        ; Simplified approach - just get a key and return ASCII
+        push    bc                      ; Save BC
         
 getchar_loop:
         MOSCALL mos_getkey              ; Get key from keyboard
-        ld      b, a                    ; Store returned value in B
+        or      a                       ; Check if zero (no key)
+        jr      z, getchar_loop         ; Keep waiting if no key
         
-        ; Check if this is a virtual key (like nano.asm does)
-        ld      a, (ix + sysvar_vkeycode) ; Check virtual key code
-        or      a                       ; Zero = normal key, non-zero = special key
-        jr      nz, getchar_loop        ; Skip special/virtual keys
-        
-        ; Get the ASCII code (like nano.asm does)
-        ld      a, (ix + sysvar_keyascii) ; Get ASCII code from system var
-        or      a                       ; Check for zero ASCII
-        jr      z, getchar_loop         ; If zero, read another key
-        
-        ; Apply filtering for our LISP needs
+        ; The key is now in A - check if it's printable ASCII or special chars we want
         cp      127                     ; Reject high ASCII
         jr      nc, getchar_loop
         cp      32                      ; Accept printable chars (32-126)
-        jr      nc, valid_ascii
+        jr      nc, valid_char
         ; Accept specific control chars we need
         cp      13                      ; CR (Enter)
-        jr      z, valid_ascii
+        jr      z, valid_char
         cp      10                      ; LF 
-        jr      z, valid_ascii
+        jr      z, valid_char
         cp      26                      ; Ctrl-Z (exit)
-        jr      z, valid_ascii
+        jr      z, valid_char
         cp      4                       ; Ctrl-D (EOF)
-        jr      z, valid_ascii
+        jr      z, valid_char
         jr      getchar_loop            ; Skip other control chars
         
-valid_ascii:
-        pop     bc
-        pop     ix
+valid_char:
+        pop     bc                      ; Restore BC
         
         ; Check for Ctrl-Z (immediate exit)
         cp      26                      ; Ctrl-Z?
         jr      z, immediate_exit
         
-        ; Echo the character back to screen (unless it's special)
-        cp      13                      ; Carriage return?
-        jr      z, getchar_echo
-        cp      10                      ; Line feed?
-        jr      z, getchar_echo
-        cp      4                       ; Ctrl-D (EOF)?
-        jr      z, getchar_no_echo
+        ; Echo the character back to screen for printable chars
         cp      32                      ; Printable characters (>= space)
-        jr      c, getchar_no_echo
+        jr      nc, getchar_echo        ; Echo printable chars
+        
+        ; Handle special control characters
+        cp      13                      ; Carriage return?
+        jr      z, getchar_echo_cr      ; Echo CR + LF
+        jr      getchar_no_echo         ; Skip echo for other control chars
         
 getchar_echo:
         push    af                      ; Save character
         rst.lil $10                     ; Echo to screen
         pop     af                      ; Restore character
+        jr      getchar_no_echo
+        
+getchar_echo_cr:
+        ; Echo carriage return and line feed
+        push    af                      ; Save character
+        ld      a, 13                   ; CR
+        rst.lil $10
+        ld      a, 10                   ; LF
+        rst.lil $10
+        pop     af                      ; Restore original character
         
 getchar_no_echo:
         ; Store character in lookbuffer
@@ -356,7 +349,8 @@ immediate_exit:
         ; Print exit message and return to MOS immediately
         ld      hl, immediate_exit_msg
         call    print_string
-        ret                             ; Return to MOS
+        ; Jump directly to the end of the program instead of returning
+        jp      finish
 
 print_hex_byte:
         ; Print byte in A as two hex digits
@@ -397,15 +391,61 @@ internbuffer:   DS INTERNMAX
 
 ; Pre-defined symbols in obarray
 init_symbols:
-        ; Simple initialization for testing
-        ; Just clear the intern buffer length
+        ; Properly initialize the obarray by clearing it
+        ld      hl, obarray
+        ld      bc, OBARRAYMAX * 3      ; Size of obarray in bytes
+        ld      de, obarray + 1
+        ld      (hl), 0                 ; Clear first byte
+        ldir                            ; Copy 0 to entire obarray
+        
+        ; Clear the intern buffer length
         ld      hl, 0
         ld      (internbufferlen), hl
         ret
 
 init_builtin_symbols:
-        ; Add essential symbols to obarray
-        ; TODO: Implement symbol creation for quote, lambda, atom, etc.
+        ; Create built-in symbols in obarray and update their references
+        
+        ; Create "quote" symbol
+        ld      hl, quote_str
+        ld      bc, 5                   ; length of "quote"
+        ld      (internbufferlen), bc
+        ld      hl, quote_str
+        ld      de, internbuffer
+        ldir                            ; Copy "quote" to internbuffer
+        call    intern
+        ld      (quote_symbol), hl
+        
+        ; Create "atom" symbol  
+        ld      hl, atom_str
+        ld      bc, 4                   ; length of "atom"
+        ld      (internbufferlen), bc
+        ld      hl, atom_str
+        ld      de, internbuffer
+        ldir                            ; Copy "atom" to internbuffer
+        call    intern
+        ld      (atom_symbol), hl
+        
+        ; Create "car" symbol
+        ld      hl, car_str
+        ld      bc, 3                   ; length of "car"
+        ld      (internbufferlen), bc
+        ld      hl, car_str
+        ld      de, internbuffer
+        ldir                            ; Copy "car" to internbuffer
+        call    intern
+        ld      (car_symbol), hl
+        
+        ; Create "cdr" symbol
+        ld      hl, cdr_str
+        ld      bc, 3                   ; length of "cdr"
+        ld      (internbufferlen), bc
+        ld      hl, cdr_str
+        ld      de, internbuffer
+        ldir                            ; Copy "cdr" to internbuffer
+        call    intern
+        ld      (cdr_symbol), hl
+        
         ret
 
 ; Intern a symbol from internbuffer
@@ -580,10 +620,10 @@ repl_loop:
         ; Read expression
         call    read_expr
         
-        ; Check for EOF (Ctrl-D)
+        ; Check for EOF marker
         ld      a, h
         or      l
-        jr      z, repl_exit
+        jr      z, repl_exit            ; Simple check: if HL is 0, treat as EOF
         
         ; Save expression for evaluation
         push    hl
@@ -1510,17 +1550,22 @@ iswhite:        ; Check if character in A is whitespace
 
 issym:          ; Check if character in A is valid for symbol
         cp      '('
-        ret     z                       ; Not valid
+        jr      z, issym_invalid        ; Not valid
         cp      ')'
-        ret     z                       ; Not valid
+        jr      z, issym_invalid        ; Not valid
         cp      '.'
-        ret     z                       ; Not valid
+        jr      z, issym_invalid        ; Not valid
         cp      ' '
-        ret     c                       ; Control chars not valid
+        jr      c, issym_invalid        ; Control chars not valid
         cp      127
-        ret     nc                      ; DEL and above not valid
-        ; Valid symbol character
-        xor     a
+        jr      nc, issym_invalid       ; DEL and above not valid
+        ; Valid symbol character - return Z flag
+        xor     a                       ; Set Z flag (valid character)
+        ret
+        
+issym_invalid:
+        ; Invalid character - return NZ flag
+        or      1                       ; Clear Z flag (invalid character)
         ret
 
 ; Skip whitespace
@@ -1565,7 +1610,7 @@ read_expr:
         ret
 
 read_eof:
-        ld      hl, NIL
+        ld      hl, EOF_MARKER
         ret
 
 read_error:
@@ -1573,8 +1618,8 @@ read_error:
         ret
 
 read_list:
-        ; Read opening parenthesis - already consumed
-        call    getchar                 ; Consume '('
+        ; Read opening parenthesis - already consumed by read_expr
+        ; Don't call getchar again, just skip whitespace
         call    skipwhite
         
         ; Check for immediate closing parenthesis
@@ -1721,17 +1766,21 @@ print_expr_done:
 nil_str:        DB "nil", 0
 symbol_str:     DB "symbol", 0
 list_str:       DB "list", 0
+quote_str:      DB "quote", 0
+atom_str:       DB "atom", 0
+car_str:        DB "car", 0
+cdr_str:        DB "cdr", 0
 panic_memory_msg: DB "PANIC: Out of memory!", $0D, $0A, 0
 
-; Built-in symbols (references to obarray entries)
-quote_symbol:   DW $0001                        ; "quote" symbol reference
-atom_symbol:    DW $0002                        ; "atom" symbol reference  
-car_symbol:     DW $0003                        ; "car" symbol reference
-cdr_symbol:     DW $0004                        ; "cdr" symbol reference
-cons_symbol:    DW $0005                        ; "cons" symbol reference
-lambda_symbol:  DW $0006                        ; "lambda" symbol reference
-t_symbol:       DW $0007                        ; "t" symbol reference
-nil_symbol:     DW $0008                        ; "nil" symbol reference
+; Built-in symbols (references to obarray entries - filled by init_builtin_symbols)
+quote_symbol:   DS 3                            ; "quote" symbol reference
+atom_symbol:    DS 3                            ; "atom" symbol reference  
+car_symbol:     DS 3                            ; "car" symbol reference
+cdr_symbol:     DS 3                            ; "cdr" symbol reference
+cons_symbol:    DS 3                            ; "cons" symbol reference
+lambda_symbol:  DS 3                            ; "lambda" symbol reference
+t_symbol:       DS 3                            ; "t" symbol reference
+nil_symbol:     DS 3                            ; "nil" symbol reference
 
 ;===============================================================================
 ; Error Handling and Program Termination
@@ -1743,6 +1792,8 @@ panic:  ; Print error message and exit
         ; Fall through to finish
 
 finish: ; Exit program
+        ; Restore original stack pointer
+        ld      sp, (original_sp)
         ret                             ; Return to MOS
         
         ; Should not reach here
