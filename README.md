@@ -1,4 +1,7 @@
-# arpilisp
+# ez80lisp
+
+based on arpilisp. 
+Kris left this pretty much working.
 
 Do you know how to implement a Lisp interpreter? Neither did I until I did. This is the result.
 
